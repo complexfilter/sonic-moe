@@ -8,8 +8,8 @@ import torch.nn.functional as F
 moe = MoE(
     num_experts=64,           # Number of experts
     num_experts_per_tok=7,     # Top-k experts per token
-    hidden_size=2048,          # Hidden dimension
-    intermediate_size=1024,    # Expert intermediate size
+    hidden_size=4096,          # Hidden dimension
+    intermediate_size=2048,    # Expert intermediate size
     is_glu=True,               # Whether to use GLU (e.g. SwiGLU) activation
     add_bias=False,            # Add bias to linear layers
     std=0.02,                  # Weight initialization std
@@ -17,7 +17,7 @@ moe = MoE(
 
 # Forward pass
 torch.manual_seed(43)
-x = torch.randn(8000, 2048, device="cuda", dtype=torch.bfloat16)
+x = torch.randn(8000, 4096, device="cuda", dtype=torch.bfloat16)
 output = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)
 
 def fwd_bwd_sonic(x, moe, dY):
@@ -30,7 +30,7 @@ def fwd_bwd_sonic(x, moe, dY):
     return output, dX, dW, dW_out
 
 mlp = MLP_SiWGLU(
-    input_size=2048, hidden_size=1024,
+    input_size=4096, hidden_size=2048,
     num_experts=64, top_k=7
 ).cuda().to(torch.bfloat16)
 
@@ -41,10 +41,9 @@ with torch.no_grad():
     mlp.output_experts.weight.copy_(moe.c_proj.weight)
 
 def MLP(x, mlp, num_activated_experts):
-    with torch.no_grad():
-        logits = F.linear(x, moe.router.weight)
-        gates, k_idxs = torch.topk(logits, num_activated_experts)
-        gates = torch.softmax(gates.float(), axis=-1).cuda().to(torch.bfloat16)
+    logits = F.linear(x, moe.router.weight)
+    gates, k_idxs = torch.topk(logits, num_activated_experts)
+    gates = torch.softmax(gates.float(), axis=-1).cuda().to(torch.bfloat16)
     Y = mlp(x, gates, k_idxs)
     return Y
 
@@ -65,6 +64,18 @@ relative_error = torch.norm(Y - output, p='fro') / torch.norm(output, p='fro')
 print("relative error:", relative_error.item())
 print(output.shape)
 
+x = x.detach().requires_grad_(True)   # ens
+y_dcmoe, dX_dcmoe, dW1, dW3, dW_out_dcmoe = fwd_bwd_dcmoe(x, mlp, 7, dY)
+
+x = x.detach().requires_grad_(True)   # ens
+y_sonic, dX_sonic, dW, dW_out_sonic = fwd_bwd_sonic(x, moe, dY)
+
+print(torch.norm(dX_dcmoe - dX_sonic, p='fro') / torch.norm(dX_sonic, p='fro'))
+print(torch.norm(y_dcmoe - y_sonic, p='fro') / torch.norm(y_sonic, p='fro'))
+print(torch.norm(dW_out_dcmoe - dW_out_sonic, p='fro') / torch.norm(dW_out_sonic, p='fro'))
+print(torch.norm(dW1 - dW[:,::2], p='fro') / torch.norm(dW[:,::2], p='fro'))
+print(torch.norm(dW3 - dW[:,1::2], p='fro') / torch.norm(dW[:,::2], p='fro'))
+
 ms = triton.testing.do_bench(lambda: MLP(x, mlp, 7), warmup=25, rep=100, quantiles = [0.2,0.5,0.8])
 print("runtime of dcmoe forward is:", ms[1])
 
@@ -75,5 +86,6 @@ x = x.detach().requires_grad_(True)   # ens
 ms = triton.testing.do_bench(lambda: fwd_bwd_dcmoe(x, mlp, 7, dY), warmup=25, rep=100, quantiles = [0.2,0.5,0.8])
 print("runtime of fwd and bwd of dcmoe is:", ms[1])
 
+x = x.detach().requires_grad_(True)   # ens
 ms = triton.testing.do_bench(lambda: fwd_bwd_sonic(x, moe, dY), warmup=25, rep=100, quantiles = [0.2,0.5,0.8])
 print("runtime of fwd and bwd of sonic moe is:", ms[1])
